@@ -2,50 +2,59 @@
 """
 nas_ea2_decode.py - decrypt 5GS NAS messages protected with 128-5G-EA2 / 128-5G-IA2.
 
-Functionality:
-  0. Starts from K_SEAF (from the N12 trace) and derives K_AMF from it with the SUPI and
-     the ABBA parameter (TS 33.501 Annex A.7). K_AMF can also be given directly.
-  1. Derives K_NASenc and K_NASint from K_AMF (TS 33.501 Annex A.8, algorithm id 2).
-  2. For every security-protected NAS PDU it finds the NAS COUNT. Only the low 8 bits
-     (the sequence number) are on the wire, so the 16-bit overflow counter is tracked
-     per direction and CONFIRMED by recomputing the 128-5G-IA2 MAC (AES-CMAC).
-  3. Decrypts the payload with 128-5G-EA2 (AES-128-CTR, TS 33.501 Annex D.2.2).
-  4. Prints a table and, with --out-n2-pcap, writes a copy of your N2 capture in which the
-     ciphered NAS payloads are replaced by their plaintext: same length, same packets, with
-     the SCTP checksum fixed. Opens in Wireshark with no configuration at all.
-     NAS is read from ngap.NAS_PDU, ngap.nAS_PDU and ngap.pDUSessionNAS_PDU.
+NAS EA2 Decoder:
+
+Decoder Logic:
+
+1. If no SUPI, K_SEAF, or K_AMF is provided by the user, the script starts to search for the
+   SUPI and K_SEAF inside the N12 authentication messages between the AMF and the AUSF.
+
+2. If SUPI cannot be extracted from the N12 authentication messages, the script searches for
+   it inside the N2 messages between the AMF and the gNB.
+
+3. The script uses K_SEAF to derive K_AMF using the SUPI and the ABBA parameter (TS 33.501
+   Annex A.7). K_AMF can also be given directly.
+
+4. Derives K_NASenc and K_NASint from K_AMF (TS 33.501 Annex A.8, algorithm id 2).
+
+5. For every security-protected NAS PDU it finds the NAS COUNT. Only the low 8 bits
+   (the sequence number) are on the wire, so the 16-bit overflow counter is tracked per
+   direction and CONFIRMED by recomputing the 128-5G-IA2 MAC (AES-CMAC).
+
+6. Decrypts the payload with 128-5G-EA2 (AES-128-CTR, TS 33.501 Annex D.2.2).
+
+4. Prints a table and, with --out-n2-pcap, writes a copy of your N2 capture in which the
+   ciphered NAS payloads are replaced by their plaintext: same length, same packets, with
+   the SCTP checksum fixed. Opens in Wireshark with no configuration at all.
+   NAS is read from ngap.NAS_PDU, ngap.nAS_PDU and ngap.pDUSessionNAS_PDU.
 
 Inputs (pick one)
+
   --pcap N2.pcap [--amf-ip 10.0.0.1] extract NAS PDUs with tshark (ngap.NAS_PDU);
+
                                      packets sent BY the AMF are downlink, the rest uplink.
+
                                      Without --amf-ip, the AMF is the destination address of
+
                                      the first non-ciphered Registration Request (0x41)
+
   --list pdus.txt                    text file, one PDU per line:  <frame> <UL|DL> <hex>
 
-Key inputs
-  None of these is needed when the trace has the N12 (AMF <-> AUSF) signalling; they
-  override what is found there.
-  --kseaf <64 hex> [--supi <IMSI digits or imsi-...>] [--abba <hex>, default 0000]
-  --kamf <64 hex>                    alternative: give K_AMF directly (no SUPI needed)
-  Both key options may be repeated (one value per security context); --supi and --abba
-  are shared by all K_SEAF values. Only IMSI-type SUPIs are supported.
 
-  Where the keys and the SUPI come from, in order:
-    K_SEAF  --kseaf/--kamf, else N12: the Nausf_UEAuthentication response reporting
-            AUTHENTICATION_SUCCESS carries "kseaf" (5G AKA) or "kSeaf" (EAP-AKA'). Each
-            successful authentication of this UE becomes one security context.
-    SUPI    --supi, else N12: the "supi" of that response, or the "supiOrSuci" of the
-            authentication request it belongs to (imsi-... or a null-scheme suci-0-...),
-            else N2: the first null-scheme SUCI in a Registration Request or Identity
-            Response (a SUCI concealed with ECIES or a 5G-GUTI cannot be used).
-  If either cannot be found, it is asked for at the terminal (or, when not run from a
-  terminal, the program stops and names the option to pass).
-  N12 is searched in --n12-pcap if given, otherwise in --pcap. If N12 is on a
-  non-standard port without the start of the HTTP/2 connection, name the port with
-  --n12-port; if it runs over TLS, give --tls-keylog.
+
+Key inputs
+
+  --kseaf <64 hex> [--supi <IMSI digits or imsi-...>] [--abba <hex>, default 0000]
+
+  --kamf <64 hex>                    alternative: give K_AMF directly
+
+  Both options may be repeated (one value per security context); --supi and --abba are
+  shared by all --kseaf values. Only IMSI-type SUPIs are supported. Without --supi, the
+  SUPI is read from the first null-scheme SUCI in a Registration Request or Identity
+  Response; a SUCI concealed with ECIES (Profile A/B) or a 5G-GUTI cannot be used.
 
 A MAC that verifies proves that the key chain (K_SEAF, SUPI, ABBA), the algorithm choice,
-COUNT, bearer and direction are all correct. If it does not verify, the "plain" output for
+COUNT, bearer, and direction are all correct. If it does not verify, the "plain" output for
 that message is a guess.
 
 Requires: python3, the 'cryptography' package, and tshark only for --pcap.
