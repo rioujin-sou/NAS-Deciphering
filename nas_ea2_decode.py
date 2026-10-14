@@ -733,6 +733,27 @@ def main():
     else:
         pdus = read_list(a.list)
 
+    # Without ciphered NAS there is nothing to decrypt: skip the key and SUPI search.
+    ciphered_frames = sorted({f for f, _, p in pdus
+                              if len(p) >= 2 and p[0] == 0x7E and p[1] & 0x0F in (2, 4)})
+    if not ciphered_frames:
+        if amf is not None:
+            print(f"AMF IP = {amf}   (from {amf_src})\n")
+        if a.view_msg:
+            print(f"{'frame':>6} {'dir':<3} {'security header':<28} message")
+            for frame, direction, pdu in pdus:
+                sht = pdu[1] & 0x0F if len(pdu) >= 2 and pdu[0] == 0x7E else 0
+                body = pdu[7:] if sht in (1, 3) else pdu
+                print(f"{frame:>6} {DIR_NAME[direction]:<3} {SHT_NAME.get(sht, '?'):<28} {describe(body)}")
+            print()
+        print(f"{len(pdus)} NAS messages, none ciphered: nothing to decrypt, "
+              "so no K_SEAF or SUPI is needed.")
+        if a.out_n2_pcap:
+            print(f"{a.out_n2_pcap} not written: it would be identical to the input.")
+        return
+    print(f"{len(ciphered_frames)} frames with ciphered NAS "
+          f"(first: frame {ciphered_frames[0]}); looking for the keys.\n")
+
     # N12 is needed for K_SEAF unless a key was given, and for the SUPI unless --supi was
     # given or only K_AMF values are used (they need no SUPI).
     n12_path = a.n12_pcap or a.pcap
