@@ -2,7 +2,7 @@
 """
 nas_ea2_decode.py - decrypt 5GS NAS messages protected with 128-5G-EA2 / 128-5G-IA2.
 
-What it does
+Functionality:
   0. Starts from K_SEAF (from the N12 trace) and derives K_AMF from it with the SUPI and
      the ABBA parameter (TS 33.501 Annex A.7). K_AMF can also be given directly.
   1. Derives K_NASenc and K_NASint from K_AMF (TS 33.501 Annex A.8, algorithm id 2).
@@ -23,20 +23,26 @@ Inputs (pick one)
   --list pdus.txt                    text file, one PDU per line:  <frame> <UL|DL> <hex>
 
 Key inputs
+  None of these is needed when the trace has the N12 (AMF <-> AUSF) signalling; they
+  override what is found there.
   --kseaf <64 hex> [--supi <IMSI digits or imsi-...>] [--abba <hex>, default 0000]
-  --kamf <64 hex>                    alternative: give K_AMF directly
-  Both options may be repeated (one value per security context); --supi and --abba are
-  shared by all --kseaf values. Only IMSI-type SUPIs are supported. Without --supi, the
-  SUPI is read from the first null-scheme SUCI in a Registration Request or Identity
-  Response; a SUCI concealed with ECIES (Profile A/B) or a 5G-GUTI cannot be used.
+  --kamf <64 hex>                    alternative: give K_AMF directly (no SUPI needed)
+  Both key options may be repeated (one value per security context); --supi and --abba
+  are shared by all K_SEAF values. Only IMSI-type SUPIs are supported.
 
-  Without --kseaf and --kamf, K_SEAF is read from the N12 (AMF <-> AUSF) signalling: the
-  Nausf_UEAuthentication response that reports AUTHENTICATION_SUCCESS carries "kseaf"
-  (5G AKA) or "kSeaf" (EAP-AKA') and usually the SUPI. N12 is searched in --n12-pcap if
-  given, otherwise in --pcap. Each successful authentication of this UE becomes one
-  security context. If N12 is on a non-standard port without the start of the HTTP/2
-  connection, name the port with --n12-port; if it runs over TLS, give --tls-keylog.
-  When the SUCI is concealed, the SUPI is taken from N12 instead.
+  Where the keys and the SUPI come from, in order:
+    K_SEAF  --kseaf/--kamf, else N12: the Nausf_UEAuthentication response reporting
+            AUTHENTICATION_SUCCESS carries "kseaf" (5G AKA) or "kSeaf" (EAP-AKA'). Each
+            successful authentication of this UE becomes one security context.
+    SUPI    --supi, else N12: the "supi" of that response, or the "supiOrSuci" of the
+            authentication request it belongs to (imsi-... or a null-scheme suci-0-...),
+            else N2: the first null-scheme SUCI in a Registration Request or Identity
+            Response (a SUCI concealed with ECIES or a 5G-GUTI cannot be used).
+  If either cannot be found, it is asked for at the terminal (or, when not run from a
+  terminal, the program stops and names the option to pass).
+  N12 is searched in --n12-pcap if given, otherwise in --pcap. If N12 is on a
+  non-standard port without the start of the HTTP/2 connection, name the port with
+  --n12-port; if it runs over TLS, give --tls-keylog.
 
 A MAC that verifies proves that the key chain (K_SEAF, SUPI, ABBA), the algorithm choice,
 COUNT, bearer and direction are all correct. If it does not verify, the "plain" output for
@@ -367,53 +373,107 @@ def run_tshark(cmd):
 @dataclass
 class N12Key:
     frame: int
-    supi: str              # IMSI digits, "" if the response had no IMSI-type SUPI
+    supi: str              # IMSI digits, "" if the authentication could not be tied to a SUPI
+    supi_frame: int        # frame the SUPI was read from (0 if none)
     k_seaf: bytes
 
 
+def supi_from_n12(value: str) -> str:
+    """IMSI digits from a SBI supi / supiOrSuci string, or "" if it does not reveal one.
+    imsi-<digits> is the SUPI itself; suci-0-<mcc>-<mnc>-<routing>-0-<key id>-<msin> is an
+    IMSI-based SUCI with the null scheme (TS 29.503 SuciInfo), whose MSIN is in clear."""
+    v = value.strip().lower()
+    if v.startswith("imsi-") and v[5:].isdigit():
+        return v[5:]
+    parts = v.split("-")
+    if len(parts) == 8 and parts[0] == "suci" and parts[1] == "0" and parts[5] == "0":
+        digits = parts[2] + parts[3] + parts[7]
+        if digits.isdigit():
+            return digits
+    return ""
+
+
+def _auth_ctx_id(url: str) -> str:
+    """'.../ue-authentications/<authCtxId>[/...]' -> authCtxId."""
+    parts = url.split("?")[0].split("/")
+    if "ue-authentications" in parts:
+        i = parts.index("ue-authentications")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return ""
+
+
 def read_n12(path, tshark, ports=(), keylog=None):
-    """K_SEAF from the Nausf_UEAuthentication responses (AUSF -> AMF) in an N12 capture:
-    5G AKA confirmation ("kseaf") and EAP-AKA' eap-session ("kSeaf"), success only."""
-    sep = "\x1f"                                   # aggregator that cannot appear in the JSON values
+    """K_SEAF and SUPI from the Nausf_UEAuthentication exchanges in an N12 capture.
+
+    POST /ue-authentications             request: supiOrSuci;  201: Location .../{authCtxId}
+    PUT  .../{authCtxId}/5g-aka-confirmation  (5G AKA)  200: authResult, kseaf, [supi]
+    POST .../{authCtxId}/eap-session          (EAP-AKA') 200: authResult, kSeaf, [supi]
+
+    Request and response travel on one HTTP/2 stream, so they are grouped per stream; the
+    authCtxId then ties the key to the SUPI of the request that started the authentication.
+    Returns ([N12Key, ...], {supi: first frame it was seen in})."""
+    sep = "\x1f"                                   # aggregator that cannot appear in the values
     cmd = [tshark, "-r", path]
     if keylog:
         cmd += ["-o", f"tls.keylog_file:{keylog}"]
     for port in ports:
         cmd += ["-d", f"tcp.port=={port},{'tls' if keylog else 'http2'}"]
-    cmd += ["-Y", 'json.key == "kseaf" || json.key == "kSeaf"', "-T", "fields",
-            "-e", "frame.number", "-e", "json.path_with_value",
+    cmd += ["-Y", 'http2.headers.path contains "ue-authentications" || '
+                  'http2.headers.location contains "ue-authentications" || '
+                  'json.key == "supiOrSuci" || json.key == "kseaf" || json.key == "kSeaf"',
+            "-T", "fields", "-e", "frame.number", "-e", "tcp.stream", "-e", "http2.streamid",
+            "-e", "http2.headers.path", "-e", "http2.headers.location", "-e", "json.path_with_value",
             "-E", "occurrence=a", "-E", f"aggregator={sep}"]
-    out, seen = [], set()
+
+    streams = {}                                   # (tcp stream, h2 stream) -> exchange
     for line in run_tshark(cmd).splitlines():
-        frame, _, members = line.partition("\t")
-        bodies, body = [], {}
-        for m in members.split(sep):               # "/key:value"; deeper paths are not needed
-            key, _, val = m[1:].partition(":")
-            if not m.startswith("/") or "/" in key:
-                continue
-            if key in body:                        # same key again: next JSON body in this frame
-                bodies.append(body)
-                body = {}
-            body[key] = val
-        bodies.append(body)
-        for b in bodies:
-            k = b.get("kseaf") or b.get("kSeaf")
-            if not k or b.get("authResult", "AUTHENTICATION_SUCCESS") != "AUTHENTICATION_SUCCESS":
-                continue
-            try:
-                k_seaf = bytes.fromhex(k)
-            except ValueError:
-                k_seaf = b""
-            if len(k_seaf) != 32:
-                print(f"WARNING: N12 frame {frame}: K_SEAF '{k}' is not 32 bytes of hex, ignored",
-                      file=sys.stderr)
-                continue
-            supi = b.get("supi", "")
-            supi = supi[5:] if supi.lower().startswith("imsi-") else ""
-            if (supi, k_seaf) not in seen:          # same response captured twice
-                seen.add((supi, k_seaf))
-                out.append(N12Key(int(frame), supi, k_seaf))
-    return out
+        cols = (line.split("\t") + [""] * 6)[:6]
+        frame, tcp, sids, path, loc, members = cols
+        sid = next((x for x in sids.split(sep) if x not in ("", "0")), "0")
+        ex = streams.setdefault((tcp, sid), {"path": "", "location": "", "json": {}})
+        ex["path"] = ex["path"] or path.split(sep)[0]
+        ex["location"] = ex["location"] or loc.split(sep)[0]
+        for m in members.split(sep) if members else ():
+            key, _, val = m[1:].partition(":")     # "/key:value"; deeper paths are not needed
+            if m.startswith("/") and "/" not in key:
+                ex["json"].setdefault(key, (val, int(frame)))
+
+    ctx_supi, supis = {}, {}                       # authCtxId -> (supi, frame); supi -> frame
+    for ex in streams.values():
+        val, frame = ex["json"].get("supiOrSuci", ("", 0))
+        supi = supi_from_n12(val)
+        if supi:
+            supis.setdefault(supi, frame)
+            ctx = _auth_ctx_id(ex["location"])
+            if ctx:
+                ctx_supi[ctx] = (supi, frame)
+
+    keys, seen = [], set()
+    for ex in sorted(streams.values(), key=lambda e: min((f for _, f in e["json"].values()), default=0)):
+        j = ex["json"]
+        k, frame = j.get("kseaf") or j.get("kSeaf") or ("", 0)
+        if not k or j.get("authResult", ("AUTHENTICATION_SUCCESS",))[0] != "AUTHENTICATION_SUCCESS":
+            continue
+        try:
+            k_seaf = bytes.fromhex(k)
+        except ValueError:
+            k_seaf = b""
+        if len(k_seaf) != 32:
+            print(f"WARNING: N12 frame {frame}: K_SEAF '{k}' is not 32 bytes of hex, ignored",
+                  file=sys.stderr)
+            continue
+        supi, supi_frame = "", 0
+        if "supi" in j and supi_from_n12(j["supi"][0]):
+            supi, supi_frame = supi_from_n12(j["supi"][0]), j["supi"][1]
+        elif _auth_ctx_id(ex["path"]) in ctx_supi:
+            supi, supi_frame = ctx_supi[_auth_ctx_id(ex["path"])]
+        if supi:
+            supis.setdefault(supi, supi_frame)
+        if (supi, k_seaf) not in seen:             # same response captured twice
+            seen.add((supi, k_seaf))
+            keys.append(N12Key(frame, supi, supi_frame, k_seaf))
+    return keys, supis
 
 
 def read_pcap(path, amf_ip, tshark):
@@ -581,6 +641,46 @@ def rewrite_n2(src, dst, repl, tshark):
     return changed, problems
 
 
+def ask(question: str, option: str, why) -> str:
+    """Ask at the terminal; when not interactive, stop and say which option to pass."""
+    detail = "".join(f"\n  {r}" for r in why)
+    if not sys.stdin.isatty():
+        raise SystemExit(f"{question} could not be found:{detail}\nPass {option}.")
+    if why:
+        print(f"{question} could not be found:{detail}")
+    try:
+        return input(f"{question}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("\naborted")
+
+
+def ask_supi(why) -> str:
+    while True:
+        try:
+            return norm_supi(ask("SUPI (IMSI digits, optionally 'imsi-...')", "--supi", why))
+        except SystemExit as e:
+            if not sys.stdin.isatty():
+                raise
+            print(e)
+            why = []
+
+
+def ask_key(why):
+    """-> ('kseaf' | 'kamf', 32-byte key)."""
+    while True:
+        answer = ask("K_SEAF or K_AMF (64 hex chars; prefix with 'kamf:' for a K_AMF)",
+                     "--kseaf (with the SUPI) or --kamf", why)
+        kind = "kamf" if answer.lower().startswith("kamf:") else "kseaf"
+        for prefix in ("kamf:", "kseaf:"):
+            if answer.lower().startswith(prefix):
+                answer = answer[len(prefix):]
+        try:
+            return kind, parse_key("K_AMF" if kind == "kamf" else "K_SEAF", answer)
+        except SystemExit as e:
+            print(e)
+            why = []
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
@@ -591,12 +691,13 @@ def main():
                          "(default: destination of the first readable Registration Request)")
     ap.add_argument("--kseaf", action="append", default=[],
                     help="K_SEAF as 64 hex chars; repeat for several security contexts "
-                         "(default: read from the N12 signalling)")
+                         "(default: read from the N12 signalling, else asked for)")
     ap.add_argument("--supi", help="IMSI digits, optionally prefixed 'imsi-' (used with --kseaf); "
-                                   "default: read from a null-scheme SUCI, or else from N12")
+                                   "default: read from N12, else from a null-scheme SUCI on N2, "
+                                   "else asked for")
     ap.add_argument("--n12-pcap",
-                    help="capture with the N12 (AMF <-> AUSF) signalling to read K_SEAF from "
-                         "(default: look in --pcap when no --kseaf/--kamf is given)")
+                    help="capture with the N12 (AMF <-> AUSF) signalling to read K_SEAF and "
+                         "the SUPI from (default: --pcap)")
     ap.add_argument("--n12-port", type=int, action="append", default=[],
                     help="TCP port of N12 to decode as HTTP/2 (or TLS with --tls-keylog); repeatable")
     ap.add_argument("--tls-keylog", help="TLS key log file (SSLKEYLOGFILE format) to decrypt N12")
@@ -606,6 +707,8 @@ def main():
                     help="K_AMF as 64 hex chars, instead of --kseaf; repeatable")
     ap.add_argument("--show-keys", action=argparse.BooleanOptionalAction, default=True,
                     help="print the derived K_AMF, K_NASenc and K_NASint (default: on)")
+    ap.add_argument("--view-msg", action="store_true",
+                    help="print the list of NAS messages with their decoding (default: only a summary)")
     ap.add_argument("--max-overflow", type=int, default=255,
                     help="highest NAS COUNT overflow value to try when matching the MAC (default 255)")
     ap.add_argument("--out-n2-pcap",
@@ -619,10 +722,6 @@ def main():
     if a.out_n2_pcap and not a.pcap:
         ap.error("--out-n2-pcap needs --pcap (it rewrites the original capture)")
 
-    n12_path = a.n12_pcap or a.pcap
-    use_n12 = a.n12_pcap or (not a.kseaf and not a.kamf)
-    if use_n12 and not n12_path:
-        ap.error("give --kseaf, --kamf, or --n12-pcap with the N12 signalling to read K_SEAF from")
     try:
         abba = bytes.fromhex(a.abba.lower().replace("0x", "").replace(" ", ""))
     except ValueError:
@@ -633,40 +732,58 @@ def main():
         pdus, amf, amf_src = read_pcap(a.pcap, a.amf_ip, a.tshark)
     else:
         pdus = read_list(a.list)
-    n12 = read_n12(n12_path, a.tshark, a.n12_port, a.tls_keylog) if use_n12 else []
-    if use_n12 and not n12 and not a.kseaf and not a.kamf:
-        raise SystemExit(f"No successful Nausf_UEAuthentication response with a K_SEAF found in "
-                         f"{n12_path}. If N12 is there, it may be on a port Wireshark does not "
-                         "decode as HTTP/2 (--n12-port) or encrypted with TLS (--tls-keylog); "
-                         "otherwise pass --kseaf or --kamf.")
 
-    supi = supi_src = None
-    if a.kseaf or n12:
-        if a.supi:
-            supi, supi_src = norm_supi(a.supi), "--supi"
-        else:
-            supi, frame, reasons = detect_supi(pdus)
-            supi_src = f"null-scheme SUCI in frame {frame}"
-            n12_supis = sorted({k.supi for k in n12 if k.supi})
-            if supi is None and len(n12_supis) == 1:
-                supi = n12_supis[0]
-                supi_src = f"N12 frame {next(k.frame for k in n12 if k.supi == supi)}"
-            elif supi is None:
-                detail = "".join(f"\n  {r}" for r in reasons)
-                if len(n12_supis) > 1:
-                    detail += "\n  N12 has several UEs: " + ", ".join(f"imsi-{s}" for s in n12_supis)
-                raise SystemExit("--supi not given and it could not be read from the capture:"
-                                 + detail + "\nPass --supi, or use --kamf.")
+    # N12 is needed for K_SEAF unless a key was given, and for the SUPI unless --supi was
+    # given or only K_AMF values are used (they need no SUPI).
+    n12_path = a.n12_pcap or a.pcap
+    want_n12 = (not a.kseaf and not a.kamf) or (a.kseaf and not a.supi)
+    n12_keys, n12_supis = (read_n12(n12_path, a.tshark, a.n12_port, a.tls_keylog)
+                           if n12_path and want_n12 else ([], {}))
+    if not n12_path:
+        n12_why = "no N12 capture (pass --n12-pcap, or --pcap with N12 in it)"
+    else:
+        n12_why = (f"no successful Nausf_UEAuthentication response with a K_SEAF in {n12_path} "
+                   "(N12 missing, on a port not decoded as HTTP/2: --n12-port, or TLS: --tls-keylog)")
 
     seaf = [(parse_key("--kseaf", ks), "--kseaf") for ks in a.kseaf]
-    if not a.kseaf:
-        for k in n12:
+    kamf = [(parse_key("--kamf", ks), "--kamf") for ks in a.kamf]
+    use_n12_keys = not seaf and not kamf and bool(n12_keys)
+    key_why = [] if seaf or kamf or n12_keys else [n12_why]
+    if key_why:
+        kind, key = ask_key(key_why)
+        (seaf if kind == "kseaf" else kamf).append((key, "the terminal"))
+
+    # SUPI: --supi, then N12, then N2, then the terminal (only needed to derive K_AMF from K_SEAF)
+    supi = supi_src = None
+    if seaf or use_n12_keys:
+        why = []
+        if a.supi:
+            supi, supi_src = norm_supi(a.supi), "--supi"
+        elif len(n12_supis) == 1:
+            supi, frame = next(iter(n12_supis.items()))
+            supi_src = f"N12 frame {frame}"
+        else:
+            why.append("N12: " + ("several UEs: " + ", ".join(f"imsi-{x}" for x in n12_supis)
+                                  if n12_supis else
+                                  "no SUPI (the response has no 'supi' and the request's "
+                                  "'supiOrSuci' is a concealed SUCI or missing)" if n12_keys
+                                  else n12_why))
+            supi, frame, reasons = detect_supi(pdus)
+            if supi:
+                supi_src = f"null-scheme SUCI in N2 frame {frame}"
+            else:
+                why += [f"N2: {r}" for r in reasons]
+                supi, supi_src = ask_supi(why), "the terminal"
+
+    if use_n12_keys:
+        for k in n12_keys:
             if k.supi and k.supi != supi:
                 print(f"N12 frame {k.frame}: K_SEAF of imsi-{k.supi} skipped (another UE)")
             else:
                 seaf.append((k.k_seaf, f"N12 frame {k.frame}"))
-        if n12 and not seaf and not a.kamf:
-            raise SystemExit(f"N12 has K_SEAF only for other UEs, none for imsi-{supi}")
+        if not seaf:
+            kind, key = ask_key([f"N12 has K_SEAF only for other UEs, none for imsi-{supi}"])
+            (seaf if kind == "kseaf" else kamf).append((key, "the terminal"))
 
     if supi:
         print(f"SUPI   = imsi-{supi}   (from {supi_src})")
@@ -679,9 +796,8 @@ def main():
     for k_seaf, src in seaf:
         keysets.append(make_keyset(f"ctx#{len(keysets)}", derive_kamf(k_seaf, supi, abba),
                                    k_seaf, f"K_SEAF from {src}"))
-    for ks in a.kamf:
-        keysets.append(make_keyset(f"ctx#{len(keysets)}", parse_key("--kamf", ks),
-                                   source="K_AMF from --kamf"))
+    for k_amf, src in kamf:
+        keysets.append(make_keyset(f"ctx#{len(keysets)}", k_amf, source=f"K_AMF from {src}"))
     if a.show_keys:
         for k in keysets:
             print(f"{k.label}:   ({k.source})")
@@ -694,9 +810,12 @@ def main():
 
     state = {UL: DirState(), DL: DirState()}
     repl = {}
-    print(f"{'frame':>6} {'dir':<3} {'security header':<28} {'COUNT':>8} {'MAC':<8} {'key':<9} message")
+    tally = {}
+    if a.view_msg:
+        print(f"{'frame':>6} {'dir':<3} {'security header':<28} {'COUNT':>8} {'MAC':<8} {'key':<9} message")
     for frame, direction, pdu in pdus:
         r = process(pdu, direction, keysets, state[direction], a.max_overflow)
+        tally[r.status] = tally.get(r.status, 0) + 1
         mac = {"ok": "ok", "mac-fail": "FAIL"}.get(r.status, "-")
         count = str(r.count) if r.count >= 0 else "-"
         sht = SHT_NAME.get(r.sht, "?")
@@ -709,15 +828,22 @@ def main():
                 what += "   (UNVERIFIED - COUNT/key probably wrong)"
             else:
                 what += "   (MAC not verified, but this message is not ciphered so it is readable)"
-        print(f"{frame:>6} {DIR_NAME[direction]:<3} {sht:<28} {count:>8} {mac:<8} {r.key:<9} {what}")
         usable = r.status in ("ok", "plain") or (r.status == "mac-fail" and (not ciphered or a.keep_unverified))
-        if r.plain and usable:
-            print(f"{'':>6}     plain NAS: {r.plain.hex()}")
+        if a.view_msg:
+            print(f"{frame:>6} {DIR_NAME[direction]:<3} {sht:<28} {count:>8} {mac:<8} {r.key:<9} {what}")
+            if r.plain and usable:
+                print(f"{'':>6}     plain NAS: {r.plain.hex()}")
         if ciphered and r.plain and (r.status == "ok" or a.keep_unverified):
             # same length (EA2 is a stream cipher): keep the security header, put the plaintext
             # in the payload and relabel the header type "ciphered" -> "integrity only"
             new = bytes([0x7E, (pdu[1] & 0xF0) | (r.sht - 1)]) + pdu[2:7] + r.plain
             repl.setdefault(frame, []).append((pdu, new))
+
+    names = {"ok": "MAC verified", "mac-fail": "MAC FAILED", "plain": "plain",
+             "not-5gmm": "not 5GMM", "unparsable": "unparsable"}
+    print(f"{'' if not a.view_msg else chr(10)}{len(pdus)} NAS messages: "
+          + ", ".join(f"{n} {names[k]}" for k, n in tally.items())
+          + ("" if a.view_msg else "   (--view-msg to list them)"))
 
     if a.out_n2_pcap:
         n_changed, problems = rewrite_n2(a.pcap, a.out_n2_pcap, repl, a.tshark)

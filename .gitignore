@@ -11,6 +11,7 @@ wheels/
 
 # Packet captures: they contain subscriber identities (IMSI/SUPI) and, with N12,
 # K_SEAF in clear, so they must never be pushed
+Traces/
 *.pcap
 *.pcapng
 *.cap
