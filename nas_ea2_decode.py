@@ -609,15 +609,17 @@ def crc32c(data) -> int:
 
 def find_sctp(frame, linktype):
     """(start, end) of the SCTP packet inside a captured frame, or None.
-    Handles Ethernet (with VLAN tags), Linux cooked and raw IP, over IPv4 or IPv6."""
+    Handles Ethernet (with VLAN tags), Linux cooked capture v1/v2 and raw IP, over IPv4/IPv6."""
     try:
         if linktype == 1:
             off, et = 14, int.from_bytes(frame[12:14], "big")
             while et in (0x8100, 0x88A8, 0x9100):          # skip VLAN tags
                 et = int.from_bytes(frame[off + 2:off + 4], "big")
                 off += 4
-        elif linktype == 113:
+        elif linktype == 113:                              # Linux cooked capture v1 (SLL)
             off, et = 16, int.from_bytes(frame[14:16], "big")
+        elif linktype == 276:                              # Linux cooked capture v2 (SLL2)
+            off, et = 20, int.from_bytes(frame[0:2], "big")
         elif linktype in (12, 101):
             off, et = 0, (0x86DD if frame[0] >> 4 == 6 else 0x0800)
         else:

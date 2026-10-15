@@ -223,8 +223,7 @@ Run `uv run python nas_ea2_decode.py --help` for all options.
 - Mapped keys use the uplink NAS COUNT per TS 33.501 Annex A.14 (N26 interworking). Messages
   sent *before* the 5G Security Mode Command may use 5G-IA1/EA1 (SNOW 3G), which is not
   implemented, so those few will not verify.
-- `--out-n2-pcap` handles Ethernet (with VLAN), Linux cooked capture v1 and raw IP. For
-  Linux cooked capture v2 (`tcpdump -i any`) the SCTP checksum of rewritten packets is not
-  updated. The output is always classic pcap.
+- `--out-n2-pcap` handles Ethernet (with VLAN), Linux cooked capture v1 and v2
+  (`tcpdump -i any`) and raw IP, over IPv4/IPv6. The output is always classic pcap.
 - The `nas-deciphering` console script declared in `pyproject.toml` is still a placeholder;
   run `nas_ea2_decode.py` as shown above.
