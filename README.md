@@ -34,10 +34,16 @@ ctx#0:   (K_SEAF from N12 frame 17)
 
 1. **Checks that there is something to decrypt.** If no NAS message in the trace is
    ciphered (security header type 2 or 4), it says so and stops: no key or SUPI is needed.
-2. **Finds K_SEAF.** From `--kseaf` / `--kamf` if given; otherwise from the N12
-   `Nausf_UEAuthentication` response that reports `AUTHENTICATION_SUCCESS` (`kseaf` for
-   5G AKA, `kSeaf` for EAP-AKA'). Each successful authentication of the UE becomes one
-   security context.
+2. **Finds the keys.** From `--kseaf` / `--kamf` if given; otherwise from the trace:
+   - **N12** — the `Nausf_UEAuthentication` response that reports `AUTHENTICATION_SUCCESS`
+     (`kseaf` for 5G AKA, `kSeaf` for EAP-AKA').
+   - **GTPv2** — for 4G↔5G interworking (N26), an EPS security context (K_ASME + uplink
+     NAS COUNT) carried in a Context Response / Forward Relocation Request, from which a
+     mapped K'_AMF is derived (TS 33.501 Annex A.14).
+
+   Every key found becomes one security context, so a capture with several UEs — or one UE
+   moving from 4G to 5G — is decrypted in a single pass; each NAS message is matched against
+   all contexts by its MAC.
 3. **Finds the SUPI**, in this order:
    - `--supi`;
    - N12: the `supi` of that response, or the `supiOrSuci` of the authentication request
@@ -190,6 +196,7 @@ uv run python nas_ea2_decode.py --pcap n2.pcap --n12-pcap n12.pcap --out-n2-pcap
 
 # Keys known: K_SEAF with the SUPI, or K_AMF directly (no SUPI needed)
 uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf <64 hex> --supi 440110000001519
+uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf-ascii "L7j/BJhZPB3mJKHeQEza2ds+gH0cPZ1ZBw2ZGX7/7io="
 uv run python nas_ea2_decode.py --pcap n2.pcap --kamf <64 hex>
 
 # Show every NAS message with its COUNT, MAC result and plaintext
@@ -205,11 +212,17 @@ Run `uv run python nas_ea2_decode.py --help` for all options.
 ## Limitations
 
 - Only 128-5G-EA2 / 128-5G-IA2 and IMSI-type SUPIs; 3GPP access only (bearer 1).
-- The NAS COUNT is tracked per direction for one UE: a capture with several UEs needs
-  filtering to one UE first.
-- K_SEAF exists only where the trace contains an authentication. A GUTI registration or a
-  4G → 5G mobility reuses an existing security context: pass `--kamf`, or the K_SEAF from
-  the earlier authentication with `--supi`.
+- Several UEs in one capture are handled (each key becomes its own context, resolved per
+  message by the MAC). The NAS COUNT overflow is tracked per direction as a hint only, so
+  heavily interleaved multi-UE traces fall back to the full COUNT search — correct, just
+  slower.
+- Keys exist only where the trace contains the authentication (N12) or the EPS context
+  transfer (GTPv2). A plain GUTI registration that reuses a context established earlier,
+  off-capture, has neither: pass `--kamf`, or the K_SEAF from the earlier trace with
+  `--supi`.
+- Mapped keys use the uplink NAS COUNT per TS 33.501 Annex A.14 (N26 interworking). Messages
+  sent *before* the 5G Security Mode Command may use 5G-IA1/EA1 (SNOW 3G), which is not
+  implemented, so those few will not verify.
 - `--out-n2-pcap` handles Ethernet (with VLAN), Linux cooked capture v1 and raw IP. For
   Linux cooked capture v2 (`tcpdump -i any`) the SCTP checksum of rewritten packets is not
   updated. The output is always classic pcap.

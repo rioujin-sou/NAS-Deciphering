@@ -6,8 +6,11 @@ NAS EA2 Decoder:
 
 Decoder Logic:
 
-1. If no SUPI, K_SEAF, or K_AMF is provided by the user, the script starts to search for the
-   SUPI and K_SEAF inside the N12 authentication messages between the AMF and the AUSF.
+1. If no SUPI, K_SEAF, or K_AMF is provided by the user, the script searches the trace for
+   keys: K_SEAF (and the SUPI) in the N12 authentication messages between the AMF and the
+   AUSF, and - for 4G <-> 5G interworking (N26) - an EPS security context (K_ASME) carried
+   over GTPv2, from which it derives a mapped K_AMF (TS 33.501 Annex A.14). Every key found
+   becomes one security context, so a trace with several UEs is decrypted in one pass.
 
 2. If SUPI cannot be extracted from the N12 authentication messages, the script searches for
    it inside the N2 messages between the AMF and the gNB.
@@ -23,7 +26,7 @@ Decoder Logic:
 
 6. Decrypts the payload with 128-5G-EA2 (AES-128-CTR, TS 33.501 Annex D.2.2).
 
-4. Prints a table and, with --out-n2-pcap, writes a copy of your N2 capture in which the
+7. Prints a table and, with --out-n2-pcap, writes a copy of your N2 capture in which the
    ciphered NAS payloads are replaced by their plaintext: same length, same packets, with
    the SCTP checksum fixed. Opens in Wireshark with no configuration at all.
    NAS is read from ngap.NAS_PDU, ngap.nAS_PDU and ngap.pDUSessionNAS_PDU.
@@ -60,6 +63,8 @@ that message is a guess.
 Requires: python3, the 'cryptography' package, and tshark only for --pcap.
 """
 import argparse
+import base64
+import binascii
 import hashlib
 import hmac
 import ipaddress
@@ -125,6 +130,18 @@ def derive_kamf(k_seaf: bytes, supi: str, abba: bytes) -> bytes:
     return hmac.new(k_seaf, s, hashlib.sha256).digest()
 
 
+FC_KAMF_MAPPED = 0x75
+
+
+def derive_kamf_mapped(k_asme: bytes, ul_nas_count: int) -> bytes:
+    """TS 33.501 Annex A.14: mapped K'_AMF = HMAC-SHA-256(K_ASME, S) with
+    S = FC(0x75) || P0 || L0, P0 = uplink NAS COUNT (4 bytes), L0 = 0x0004.
+    Used for EPS -> 5GS interworking (N26): the EPS security context (K_ASME and the NAS
+    uplink COUNT) is carried to the AMF over GTPv2, and the AMF maps it to a 5G K_AMF."""
+    s = bytes([FC_KAMF_MAPPED]) + struct.pack(">I", ul_nas_count) + struct.pack(">H", 4)
+    return hmac.new(k_asme, s, hashlib.sha256).digest()
+
+
 def _block_tail(bearer: int, direction: int) -> int:
     return (bearer << 3) | (direction << 2)
 
@@ -152,6 +169,7 @@ class KeySet:
     k_int: bytes
     k_amf: bytes = b""
     k_seaf: bytes = b""
+    k_asme: bytes = b""
     source: str = ""
 
 
@@ -166,6 +184,17 @@ def parse_key(name: str, hex_str: str) -> bytes:
     return k
 
 
+def parse_key_b64(name: str, b64_str: str) -> bytes:
+    """A 32-byte key written in base64 (44 characters ending in '='), as some tools log it."""
+    try:
+        k = base64.b64decode(b64_str.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        raise SystemExit(f"{name} is not valid base64")
+    if len(k) != 32:
+        raise SystemExit(f"{name} must decode to 32 bytes (44 base64 chars), got {len(k)} bytes")
+    return k
+
+
 def norm_supi(supi: str) -> str:
     s = supi.strip()
     if s.lower().startswith("imsi-"):
@@ -175,9 +204,10 @@ def norm_supi(supi: str) -> str:
     return s
 
 
-def make_keyset(label: str, k_amf: bytes, k_seaf: bytes = b"", source: str = "") -> KeySet:
+def make_keyset(label: str, k_amf: bytes, k_seaf: bytes = b"", k_asme: bytes = b"",
+                source: str = "") -> KeySet:
     return KeySet(label, kdf_nas_key(k_amf, 0x01, ALG_EA2), kdf_nas_key(k_amf, 0x02, ALG_IA2),
-                  k_amf, k_seaf, source)
+                  k_amf, k_seaf, k_asme, source)
 
 
 @dataclass
@@ -485,6 +515,42 @@ def read_n12(path, tshark, ports=(), keylog=None):
     return keys, supis
 
 
+@dataclass
+class MappedKey:
+    frame: int
+    supi: str              # IMSI digits from the GTPv2 message, "" if absent
+    k_asme: bytes
+    k_amf: bytes           # mapped K'_AMF derived from K_ASME (TS 33.501 Annex A.14)
+
+
+def read_gtpv2(path, tshark):
+    """Mapped 5G keys from an EPS security context carried over GTPv2 (EPS <-> 5GS, N26/S10).
+    The MM Context IE of a Context Response or Forward Relocation Request holds K_ASME and the
+    NAS uplink COUNT; each becomes one mapped K'_AMF. Returns [MappedKey, ...]."""
+    sep = "\x1f"
+    cmd = [tshark, "-r", path,
+           "-Y", "gtpv2.mm_context_kasme", "-T", "fields",
+           "-e", "frame.number", "-e", "e212.imsi", "-e", "gtpv2.mm_context_kasme",
+           "-e", "gtpv2.mm_context_nas_ul_cnt",
+           "-E", "occurrence=a", "-E", f"aggregator={sep}"]
+    out, seen = [], set()
+    for line in run_tshark(cmd).splitlines():
+        frame, imsis, kasmes, ulcnts = (line.split("\t") + [""] * 4)[:4]
+        imsi = next((x for x in imsis.split(sep) if x), "")
+        for kasme_hex, ul in zip(kasmes.split(sep), ulcnts.split(sep)):
+            try:
+                k_asme = bytes.fromhex(kasme_hex)
+                ul_count = int(ul)
+            except ValueError:
+                continue
+            if len(k_asme) != 32 or (imsi, kasme_hex, ul_count) in seen:
+                continue
+            seen.add((imsi, kasme_hex, ul_count))
+            out.append(MappedKey(int(frame), imsi if imsi.isdigit() else "",
+                                 k_asme, derive_kamf_mapped(k_asme, ul_count)))
+    return out
+
+
 def read_pcap(path, amf_ip, tshark):
     """-> ([(frame, direction, NAS PDU), ...], AMF address, where the address came from)."""
     amf, amf_src = None, "--amf-ip"
@@ -701,6 +767,9 @@ def main():
     ap.add_argument("--kseaf", action="append", default=[],
                     help="K_SEAF as 64 hex chars; repeat for several security contexts "
                          "(default: read from the N12 signalling, else asked for)")
+    ap.add_argument("--kseaf-ascii", action="append", default=[],
+                    help="K_SEAF in base64 text, e.g. 'L7j/BJhZPB3mJKHeQEza2ds+gH0cPZ1ZBw2ZGX7/7io=' "
+                         "(quote it); same use as --kseaf, repeatable")
     ap.add_argument("--supi", help="IMSI digits, optionally prefixed 'imsi-' (used with --kseaf); "
                                    "default: read from N12, else from a null-scheme SUCI on N2, "
                                    "else asked for")
@@ -763,29 +832,46 @@ def main():
     print(f"{len(ciphered_frames)} frames with ciphered NAS "
           f"(first: frame {ciphered_frames[0]}); looking for the keys.\n")
 
-    # N12 is needed for K_SEAF unless a key was given, and for the SUPI unless --supi was
-    # given or only K_AMF values are used (they need no SUPI).
+    # Keys are gathered automatically from the trace - N12 K_SEAF (native 5G authentication)
+    # and a mapped K_AMF from an EPS security context carried over GTPv2 (4G <-> 5G N26
+    # interworking) - and from the command line. Every key found becomes a security context;
+    # a multi-UE trace yields several, and each NAS message is tried against all of them.
     n12_path = a.n12_pcap or a.pcap
-    want_n12 = (not a.kseaf and not a.kamf) or (a.kseaf and not a.supi)
+    kseaf_given = a.kseaf or a.kseaf_ascii
+    want_auto = not kseaf_given and not a.kamf        # pull keys from the trace
+    want_n12 = want_auto or (kseaf_given and not a.supi)   # also read N12 just for the SUPI
     n12_keys, n12_supis = (read_n12(n12_path, a.tshark, a.n12_port, a.tls_keylog)
                            if n12_path and want_n12 else ([], {}))
+    mapped = read_gtpv2(a.pcap, a.tshark) if (a.pcap and want_auto) else []
     if not n12_path:
         n12_why = "no N12 capture (pass --n12-pcap, or --pcap with N12 in it)"
     else:
-        n12_why = (f"no successful Nausf_UEAuthentication response with a K_SEAF in {n12_path} "
-                   "(N12 missing, on a port not decoded as HTTP/2: --n12-port, or TLS: --tls-keylog)")
+        n12_why = (f"no K_SEAF (N12 Nausf_UEAuthentication) or K_ASME (GTPv2 EPS context) in "
+                   f"{n12_path} (N12 missing, on a port not decoded as HTTP/2: --n12-port, "
+                   "or TLS: --tls-keylog)")
 
-    seaf = [(parse_key("--kseaf", ks), "--kseaf") for ks in a.kseaf]
-    kamf = [(parse_key("--kamf", ks), "--kamf") for ks in a.kamf]
-    use_n12_keys = not seaf and not kamf and bool(n12_keys)
-    key_why = [] if seaf or kamf or n12_keys else [n12_why]
-    if key_why:
-        kind, key = ask_key(key_why)
-        (seaf if kind == "kseaf" else kamf).append((key, "the terminal"))
+    # Each collected key is either a K_SEAF (needs a SUPI to make K_AMF) or a K_AMF already.
+    # seaf entry: (K_SEAF, SUPI for this key or None to use the shared one, source)
+    seaf = [(parse_key("--kseaf", ks), None, "--kseaf") for ks in a.kseaf]
+    seaf += [(parse_key_b64("--kseaf-ascii", ks), None, "--kseaf-ascii") for ks in a.kseaf_ascii]
+    # kamf entry: (K_AMF, K_ASME it was mapped from or b"", source)
+    kamf = [(parse_key("--kamf", ks), b"", "--kamf") for ks in a.kamf]
+    for m in mapped:
+        kamf.append((m.k_amf, m.k_asme,
+                     f"GTPv2 frame {m.frame}" + (f", imsi-{m.supi}" if m.supi else "")))
+    if want_auto:
+        for k in n12_keys:
+            seaf.append((k.k_seaf, k.supi or None,
+                         f"N12 frame {k.frame}" + (f", imsi-{k.supi}" if k.supi else "")))
 
-    # SUPI: --supi, then N12, then N2, then the terminal (only needed to derive K_AMF from K_SEAF)
+    if not seaf and not kamf:
+        kind, key = ask_key([n12_why])
+        (seaf if kind == "kseaf" else kamf).append(
+            (key, None, "the terminal") if kind == "kseaf" else (key, b"", "the terminal"))
+
+    # A shared SUPI is needed only for K_SEAF values that do not carry their own (e.g. --kseaf).
     supi = supi_src = None
-    if seaf or use_n12_keys:
+    if any(s is None for _, s, _ in seaf):
         why = []
         if a.supi:
             supi, supi_src = norm_supi(a.supi), "--supi"
@@ -805,32 +891,37 @@ def main():
                 why += [f"N2: {r}" for r in reasons]
                 supi, supi_src = ask_supi(why), "the terminal"
 
-    if use_n12_keys:
-        for k in n12_keys:
-            if k.supi and k.supi != supi:
-                print(f"N12 frame {k.frame}: K_SEAF of imsi-{k.supi} skipped (another UE)")
-            else:
-                seaf.append((k.k_seaf, f"N12 frame {k.frame}"))
-        if not seaf:
-            kind, key = ask_key([f"N12 has K_SEAF only for other UEs, none for imsi-{supi}"])
-            (seaf if kind == "kseaf" else kamf).append((key, "the terminal"))
-
-    if supi:
-        print(f"SUPI   = imsi-{supi}   (from {supi_src})")
+    # Summary of the SUPIs across all contexts (one UE, or several in a multi-UE trace).
+    supi_srcs = {}
+    for _, s, src in seaf:
+        v = s or supi
+        if v and v not in supi_srcs:
+            supi_srcs[v] = supi_src if s is None else src.split(",")[0]
+    for m in mapped:
+        if m.supi and m.supi not in supi_srcs:
+            supi_srcs[m.supi] = f"GTPv2 frame {m.frame}"
+    if len(supi_srcs) == 1:
+        (v, src), = supi_srcs.items()
+        print(f"SUPI   = imsi-{v}   (from {src})")
+    elif supi_srcs:
+        print("SUPIs  = " + ", ".join(f"imsi-{v} (from {src})" for v, src in supi_srcs.items()))
     if amf is not None:
         print(f"AMF IP = {amf}   (from {amf_src})")
-    if supi or amf is not None:
+    if supi_srcs or amf is not None:
         print()
 
     keysets = []
-    for k_seaf, src in seaf:
-        keysets.append(make_keyset(f"ctx#{len(keysets)}", derive_kamf(k_seaf, supi, abba),
-                                   k_seaf, f"K_SEAF from {src}"))
-    for k_amf, src in kamf:
-        keysets.append(make_keyset(f"ctx#{len(keysets)}", k_amf, source=f"K_AMF from {src}"))
+    for k_seaf, s, src in seaf:
+        keysets.append(make_keyset(f"ctx#{len(keysets)}", derive_kamf(k_seaf, s or supi, abba),
+                                   k_seaf=k_seaf, source=f"K_SEAF from {src}"))
+    for k_amf, k_asme, src in kamf:
+        label = ("mapped K_AMF from " + src) if k_asme else ("K_AMF from " + src)
+        keysets.append(make_keyset(f"ctx#{len(keysets)}", k_amf, k_asme=k_asme, source=label))
     if a.show_keys:
         for k in keysets:
             print(f"{k.label}:   ({k.source})")
+            if k.k_asme:
+                print(f"  K_ASME   = {k.k_asme.hex()}")
             if k.k_seaf:
                 print(f"  K_SEAF   = {k.k_seaf.hex()}")
             print(f"  K_AMF    = {k.k_amf.hex()}")
