@@ -34,7 +34,8 @@ ctx#0:   (K_SEAF from N12 frame 17)
 
 1. **Checks that there is something to decrypt.** If no NAS message in the trace is
    ciphered (security header type 2 or 4), it says so and stops: no key or SUPI is needed.
-2. **Finds the keys.** From `--kseaf` / `--kamf` if given; otherwise from the trace:
+2. **Finds the keys.** From `--kseaf` / `--kamf` if given (each also has an `-ascii` form
+   that takes the key as base64 text instead of 64 hex chars); otherwise from the trace:
    - **N12** — the `Nausf_UEAuthentication` response that reports `AUTHENTICATION_SUCCESS`
      (`kseaf` for 5G AKA, `kSeaf` for EAP-AKA').
    - **GTPv2** — for 4G↔5G interworking (N26), an EPS security context (K_ASME + uplink
@@ -196,8 +197,11 @@ uv run python nas_ea2_decode.py --pcap n2.pcap --n12-pcap n12.pcap --out-n2-pcap
 
 # Keys known: K_SEAF with the SUPI, or K_AMF directly (no SUPI needed)
 uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf <64 hex> --supi 440110000001519
-uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf-ascii "L7j/BJhZPB3mJKHeQEza2ds+gH0cPZ1ZBw2ZGX7/7io="
-uv run python nas_ea2_decode.py --pcap n2.pcap --kamf <64 hex>
+uv run python nas_ea2_decode.py --pcap n2.pcap --kamf  <64 hex>
+
+# Keys as base64 text instead of hex (both --kseaf and --kamf have an -ascii form)
+uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf-ascii "L7j/BJhZPB3mJKHeQEza2ds+gH0cPZ1ZBw2ZGX7/7io=" --supi 440110000001519
+uv run python nas_ea2_decode.py --pcap n2.pcap --kamf-ascii  "ZbCiC1G0iSEczsnyZjxnhQ3ZHPL9AVFgEvNrsWuS8tk="
 
 # Show every NAS message with its COUNT, MAC result and plaintext
 uv run python nas_ea2_decode.py --pcap trace.pcap --view-msg

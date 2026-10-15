@@ -195,6 +195,25 @@ def parse_key_b64(name: str, b64_str: str) -> bytes:
     return k
 
 
+def parse_key_any(name: str, s: str) -> bytes:
+    """A 32-byte key written either in hex (64 chars) or in base64 (44 chars)."""
+    h = s.lower().replace("0x", "").replace(":", "").replace(" ", "")
+    try:
+        k = bytes.fromhex(h)
+        if len(k) == 32:
+            return k
+    except ValueError:
+        pass
+    try:
+        k = base64.b64decode(s.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        raise SystemExit(f"{name} is not valid hex or base64")
+    if len(k) != 32:
+        raise SystemExit(f"{name} must be 32 bytes (64 hex chars or 44 base64 chars), "
+                         f"got {len(k)} bytes")
+    return k
+
+
 def norm_supi(supi: str) -> str:
     s = supi.strip()
     if s.lower().startswith("imsi-"):
@@ -321,17 +340,24 @@ def _is_amf(addr_field, amf):
     return False
 
 
-def is_registration_request(pdu: bytes) -> bool:
-    """True for a 5GMM Registration Request that is readable on the wire:
-    plain (SHT 0) or integrity protected but not ciphered (SHT 1 or 3)."""
+# 5GMM message types whose direction is fixed, used to locate the AMF on N2.
+# AMF -> UE (the AMF is the source); UE -> AMF (the AMF is the destination).
+MM_FROM_AMF = {0x42, 0x44, 0x46, 0x47, 0x4D, 0x4E, 0x54, 0x56, 0x58, 0x5A, 0x5B, 0x5D, 0x65, 0x68}
+MM_FROM_UE = {0x41, 0x43, 0x45, 0x48, 0x4C, 0x55, 0x57, 0x59, 0x5C, 0x5E, 0x5F, 0x66, 0x67}
+
+
+def readable_mm_type(pdu: bytes):
+    """The 5GMM message type of a PDU that is readable on the wire - plain (SHT 0) or
+    integrity protected but not ciphered (SHT 1 or 3) - else None. A ciphered PDU (SHT 2/4)
+    hides the message type, so it cannot be used."""
     if len(pdu) < 3 or pdu[0] != 0x7E:
-        return False
+        return None
     sht = pdu[1] & 0x0F
     if sht == 0:
-        return pdu[2] == 0x41
-    if sht in (1, 3) and len(pdu) >= 10:           # 7-byte security header, then the plain message
-        return pdu[7] == 0x7E and pdu[9] == 0x41
-    return False
+        return pdu[2]
+    if sht in (1, 3) and len(pdu) >= 10 and pdu[7] == 0x7E:   # 7-byte header, then the message
+        return pdu[9]
+    return None
 
 
 def _bcd(data: bytes) -> str:
@@ -385,19 +411,34 @@ def detect_supi(pdus):
     return None, None, reasons or ["no readable Registration Request or Identity Response found"]
 
 
+def _first_ip(addr_field):
+    for s in addr_field.split(","):
+        try:
+            return ipaddress.ip_address(s.strip())
+        except ValueError:
+            continue
+    return None
+
+
 def detect_amf(rows):
-    """AMF address = destination of the first readable Registration Request (sent UE -> AMF).
-    Returns (address, frame)."""
-    for frame, _src, dst, pdus in rows:
-        if any(is_registration_request(p) for p in pdus):
-            for s in dst.split(","):
-                try:
-                    amf = ipaddress.ip_address(s.strip())
-                except ValueError:
-                    continue
-                return amf, frame
-    raise SystemExit("--amf-ip not given and no readable Registration Request (0x41) found "
-                     "to detect it from; pass --amf-ip")
+    """Locate the AMF on N2 from the first readable NAS message whose direction is fixed:
+    the AMF is the source of an AMF-originated message (Authentication Request, Security Mode
+    Command, Identity Request, ...) and the destination of a UE-originated one (Registration
+    Request, ...). Returns (address, frame, message type)."""
+    for frame, src, dst, pdus in rows:
+        for p in pdus:
+            t = readable_mm_type(p)
+            if t in MM_FROM_AMF:
+                amf = _first_ip(src)
+                if amf is not None:
+                    return amf, frame, t
+            elif t in MM_FROM_UE:
+                amf = _first_ip(dst)
+                if amf is not None:
+                    return amf, frame, t
+    raise SystemExit("--amf-ip not given and no readable NAS message with a known direction "
+                     "(e.g. Registration Request, Authentication Request, Security Mode Command) "
+                     "was found to detect it from; pass --amf-ip")
 
 
 def run_tshark(cmd):
@@ -515,6 +556,32 @@ def read_n12(path, tshark, ports=(), keylog=None):
     return keys, supis
 
 
+def read_sbi_supis(path, tshark, ports=(), keylog=None):
+    """Every SUPI (imsi-...) carried in an SBI 'supi' JSON field anywhere in the trace, not
+    only the authentication exchange: Nsmf_PDUSession, Namf_* and so on all carry it. Lets the
+    SUPI be found when the UE used a 5G-GUTI or a concealed SUCI on N2 and did not authenticate
+    in the capture. Returns {supi digits: first frame it was seen in}."""
+    sep = "\x1f"
+    cmd = [tshark, "-r", path]
+    if keylog:
+        cmd += ["-o", f"tls.keylog_file:{keylog}"]
+    for port in ports:
+        cmd += ["-d", f"tcp.port=={port},{'tls' if keylog else 'http2'}"]
+    cmd += ["-Y", 'json.key == "supi"', "-T", "fields",
+            "-e", "frame.number", "-e", "json.path_with_value",
+            "-E", "occurrence=a", "-E", f"aggregator={sep}"]
+    out = {}
+    for line in run_tshark(cmd).splitlines():
+        frame, _, members = line.partition("\t")
+        for m in members.split(sep):
+            key, _, val = m[1:].partition(":")      # "/…/supi:imsi-…"
+            if key.split("/")[-1] == "supi":
+                s = supi_from_n12(val)
+                if s:
+                    out.setdefault(s, int(frame))
+    return out
+
+
 @dataclass
 class MappedKey:
     frame: int
@@ -574,8 +641,8 @@ def read_pcap(path, amf_ip, tshark):
         pdus = [parse_hex(h) for col in cols[5:] for h in col.split(",") if h.strip()]
         rows.append((int(cols[0]), cols[1] + "," + cols[2], cols[3] + "," + cols[4], pdus))
     if amf is None and rows:
-        amf, frame = detect_amf(rows)
-        amf_src = f"Registration Request in frame {frame}"
+        amf, frame, mm_type = detect_amf(rows)
+        amf_src = f"{MM_TYPES.get(mm_type, f'5GMM 0x{mm_type:02x}')} in frame {frame}"
     out = []
     for frame, src, _dst, pdus in rows:
         direction = DL if _is_amf(src, amf) else UL
@@ -745,14 +812,14 @@ def ask_supi(why) -> str:
 def ask_key(why):
     """-> ('kseaf' | 'kamf', 32-byte key)."""
     while True:
-        answer = ask("K_SEAF or K_AMF (64 hex chars; prefix with 'kamf:' for a K_AMF)",
-                     "--kseaf (with the SUPI) or --kamf", why)
+        answer = ask("K_SEAF or K_AMF (64 hex or 44 base64 chars; prefix with 'kamf:' for a K_AMF)",
+                     "--kseaf / --kseaf-ascii (with the SUPI) or --kamf", why)
         kind = "kamf" if answer.lower().startswith("kamf:") else "kseaf"
         for prefix in ("kamf:", "kseaf:"):
             if answer.lower().startswith(prefix):
                 answer = answer[len(prefix):]
         try:
-            return kind, parse_key("K_AMF" if kind == "kamf" else "K_SEAF", answer)
+            return kind, parse_key_any("K_AMF" if kind == "kamf" else "K_SEAF", answer.strip())
         except SystemExit as e:
             print(e)
             why = []
@@ -785,6 +852,8 @@ def main():
                     help="ABBA parameter in hex, from the Authentication Request (default 0000)")
     ap.add_argument("--kamf", action="append", default=[],
                     help="K_AMF as 64 hex chars, instead of --kseaf; repeatable")
+    ap.add_argument("--kamf-ascii", action="append", default=[],
+                    help="K_AMF in base64 text (quote it); same use as --kamf, repeatable")
     ap.add_argument("--show-keys", action=argparse.BooleanOptionalAction, default=True,
                     help="print the derived K_AMF, K_NASenc and K_NASint (default: on)")
     ap.add_argument("--view-msg", action="store_true",
@@ -840,10 +909,15 @@ def main():
     # a multi-UE trace yields several, and each NAS message is tried against all of them.
     n12_path = a.n12_pcap or a.pcap
     kseaf_given = a.kseaf or a.kseaf_ascii
-    want_auto = not kseaf_given and not a.kamf        # pull keys from the trace
+    kamf_given = a.kamf or a.kamf_ascii
+    want_auto = not kseaf_given and not kamf_given    # pull keys from the trace
     want_n12 = want_auto or (kseaf_given and not a.supi)   # also read N12 just for the SUPI
     n12_keys, n12_supis = (read_n12(n12_path, a.tshark, a.n12_port, a.tls_keylog)
                            if n12_path and want_n12 else ([], {}))
+    # SUPIs seen anywhere in the SBI signalling (not only the auth exchange); N12 auth wins.
+    sig_supis = n12_supis
+    if n12_path and want_n12:
+        sig_supis = {**read_sbi_supis(n12_path, a.tshark, a.n12_port, a.tls_keylog), **n12_supis}
     mapped = read_gtpv2(a.pcap, a.tshark) if (a.pcap and want_auto) else []
     if not n12_path:
         n12_why = "no N12 capture (pass --n12-pcap, or --pcap with N12 in it)"
@@ -858,6 +932,7 @@ def main():
     seaf += [(parse_key_b64("--kseaf-ascii", ks), None, "--kseaf-ascii") for ks in a.kseaf_ascii]
     # kamf entry: (K_AMF, K_ASME it was mapped from or b"", source)
     kamf = [(parse_key("--kamf", ks), b"", "--kamf") for ks in a.kamf]
+    kamf += [(parse_key_b64("--kamf-ascii", ks), b"", "--kamf-ascii") for ks in a.kamf_ascii]
     for m in mapped:
         kamf.append((m.k_amf, m.k_asme,
                      f"GTPv2 frame {m.frame}" + (f", imsi-{m.supi}" if m.supi else "")))
@@ -877,14 +952,13 @@ def main():
         why = []
         if a.supi:
             supi, supi_src = norm_supi(a.supi), "--supi"
-        elif len(n12_supis) == 1:
-            supi, frame = next(iter(n12_supis.items()))
-            supi_src = f"N12 frame {frame}"
+        elif len(sig_supis) == 1:
+            supi, frame = next(iter(sig_supis.items()))
+            supi_src = f"SBI frame {frame}"
         else:
-            why.append("N12: " + ("several UEs: " + ", ".join(f"imsi-{x}" for x in n12_supis)
-                                  if n12_supis else
-                                  "no SUPI (the response has no 'supi' and the request's "
-                                  "'supiOrSuci' is a concealed SUCI or missing)" if n12_keys
+            why.append("SBI: " + ("several UEs: " + ", ".join(f"imsi-{x}" for x in sig_supis)
+                                  if sig_supis else
+                                  "no 'supi' field in the N12/SBI signalling" if n12_path
                                   else n12_why))
             supi, frame, reasons = detect_supi(pdus)
             if supi:
