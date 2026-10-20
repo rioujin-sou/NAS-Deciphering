@@ -12,14 +12,14 @@ uv run python nas_ea2_decode.py --pcap trace.pcap --out-n2-pcap trace_decrypted.
 ```
 
 ```
-SUPI   = imsi-440110000001519   (from N12 frame 5)
+SUPI   = imsi-4401100000XXXXX   (from N12 frame 5)
 AMF IP = 240b:c0e0:205:2024:c901:1:c9:2201   (from Registration Request in frame 1)
 
 ctx#0:   (K_SEAF from N12 frame 17)
-  K_SEAF   = 835d8ee49c1ba19b11773ea4f6b3ce7ad77766f4f0beb7b9c294305520eef93b
-  K_AMF    = 65b0a20b51b489211ccec9f2663c67850dd91cf2fd01516012f36bb16b92f2d9
-  K_NASenc = 3a394334810d09a42e01f739f5fbbba0
-  K_NASint = 269f68aa38c76efcfdc8642468a6a0f5
+  K_SEAF   = 835d8ee49c1ba19b11773ea4f6b3ce7ad77766f4f0beb7b9c294305520eXXXXX
+  K_AMF    = 65b0a20b51b489211ccec9f2663c67850dd91cf2fd01516012f36bb16b9XXXXX
+  K_NASenc = 3a394334810d09a42e01f739f5fXXXXX
+  K_NASint = 269f68aa38c76efcfdc8642468aXXXXX
 
 28 NAS messages: 6 plain, 22 MAC verified   (--view-msg to list them)
 ```
@@ -196,12 +196,12 @@ uv run python nas_ea2_decode.py --pcap trace.pcap --out-n2-pcap trace_decrypted.
 uv run python nas_ea2_decode.py --pcap n2.pcap --n12-pcap n12.pcap --out-n2-pcap out.pcap
 
 # Keys known: K_SEAF with the SUPI, or K_AMF directly (no SUPI needed)
-uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf <64 hex> --supi 440110000001519
+uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf <64 hex> --supi 4401100000XXXXX
 uv run python nas_ea2_decode.py --pcap n2.pcap --kamf  <64 hex>
 
 # Keys as base64 text instead of hex (both --kseaf and --kamf have an -ascii form)
-uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf-ascii "L7j/BJhZPB3mJKHeQEza2ds+gH0cPZ1ZBw2ZGX7/7io=" --supi 440110000001519
-uv run python nas_ea2_decode.py --pcap n2.pcap --kamf-ascii  "ZbCiC1G0iSEczsnyZjxnhQ3ZHPL9AVFgEvNrsWuS8tk="
+uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf-ascii "L7j/BJhZPB3mJKHeQEza2ds+gH0cPZ1ZBw2ZGX7XXXXX" --supi 4401100000XXXXX
+uv run python nas_ea2_decode.py --pcap n2.pcap --kamf-ascii  "ZbCiC1G0iSEczsnyZjxnhQ3ZHPL9AVFgEvNrsWuXXXXX"
 
 # Show every NAS message with its COUNT, MAC result and plaintext
 uv run python nas_ea2_decode.py --pcap trace.pcap --view-msg
