@@ -34,8 +34,9 @@ ctx#0:   (K_SEAF from N12 frame 17)
 
 1. **Checks that there is something to decrypt.** If no NAS message in the trace is
    ciphered (security header type 2 or 4), it says so and stops: no key or SUPI is needed.
-2. **Finds the keys.** From `--kseaf` / `--kamf` if given (each also has an `-ascii` form
-   that takes the key as base64 text instead of 64 hex chars); otherwise from the trace:
+2. **Finds the keys.** From the trace, plus any given with `--kseaf` / `--kamf` (each also
+   has an `-ascii` form that takes the key as base64 text instead of 64 hex chars), e.g. for
+   a UE whose security context was set up before the capture started. From the trace:
    - **N12** — the `Nausf_UEAuthentication` response that reports `AUTHENTICATION_SUCCESS`
      (`kseaf` for 5G AKA, `kSeaf` for EAP-AKA').
    - **GTPv2** — for 4G↔5G interworking (N26), an EPS security context (K_ASME + uplink
@@ -98,7 +99,7 @@ flowchart LR
 | N12 input | `read_n12`, `supi_from_n12`, `_auth_ctx_id` | K_SEAF and SUPI from `Nausf_UEAuthentication`, grouped per HTTP/2 stream and linked by authentication context ID |
 | SUPI from N2 | `detect_supi`, `supi_from_suci` | IMSI from a null-scheme SUCI (TS 24.501 9.11.3.4) |
 | Decryption | `process`, `DirState`, `describe` | NAS COUNT search confirmed by MAC, decryption, message naming |
-| Output | `rewrite_n2`, `find_sctp`, `crc32c`, `read_classic_pcap` | In-place rewrite of the capture with SCTP checksum fix |
+| Output | `rewrite_n2`, `find_sctp`, `crc32c`, `read_capture` | In-place rewrite of the pcap / pcapng capture with SCTP checksum fix |
 | Interaction | `ask`, `ask_supi`, `ask_key` | Terminal prompts, or a clear error when not interactive |
 | Entry point | `main` | Options, lookup order, printing |
 
@@ -195,7 +196,8 @@ uv run python nas_ea2_decode.py --pcap trace.pcap --out-n2-pcap trace_decrypted.
 # N12 captured separately
 uv run python nas_ea2_decode.py --pcap n2.pcap --n12-pcap n12.pcap --out-n2-pcap out.pcap
 
-# Keys known: K_SEAF with the SUPI, or K_AMF directly (no SUPI needed)
+# Keys known: K_SEAF with the SUPI, or K_AMF directly (no SUPI needed); repeatable, and
+# added to any keys found in the trace
 uv run python nas_ea2_decode.py --pcap n2.pcap --kseaf <64 hex> --supi 4401100000XXXXX
 uv run python nas_ea2_decode.py --pcap n2.pcap --kamf  <64 hex>
 
@@ -222,12 +224,16 @@ Run `uv run python nas_ea2_decode.py --help` for all options.
   slower.
 - Keys exist only where the trace contains the authentication (N12) or the EPS context
   transfer (GTPv2). A plain GUTI registration that reuses a context established earlier,
-  off-capture, has neither: pass `--kamf`, or the K_SEAF from the earlier trace with
-  `--supi`.
+  off-capture, has neither: pass `--kamf` (e.g. the `KAmf` from the AMF's
+  `show subscriber`), or the K_SEAF from the earlier trace with `--supi`. These are used
+  together with the keys found in the trace.
 - Mapped keys use the uplink NAS COUNT per TS 33.501 Annex A.14 (N26 interworking). Messages
   sent *before* the 5G Security Mode Command may use 5G-IA1/EA1 (SNOW 3G), which is not
   implemented, so those few will not verify.
 - `--out-n2-pcap` handles Ethernet (with VLAN), Linux cooked capture v1 and v2
-  (`tcpdump -i any`) and raw IP, over IPv4/IPv6. The output is always classic pcap.
+  (`tcpdump -i any`) and raw IP, over IPv4/IPv6. The output keeps the input's format
+  (classic pcap or pcapng), so a merged pcapng mixing link types (e.g. Ethernet and
+  Linux cooked) is supported; name the output `.pcapng` in that case. A pcapng keeps its
+  file and packet comments, interfaces and every other block unchanged.
 - The `nas-deciphering` console script declared in `pyproject.toml` is still a placeholder;
   run `nas_ea2_decode.py` as shown above.

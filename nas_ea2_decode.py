@@ -6,11 +6,12 @@ NAS EA2 Decoder:
 
 Decoder Logic:
 
-1. If no SUPI, K_SEAF, or K_AMF is provided by the user, the script searches the trace for
-   keys: K_SEAF (and the SUPI) in the N12 authentication messages between the AMF and the
+1. The script searches the trace for keys: K_SEAF (and the SUPI) in the N12 authentication messages between the AMF and the
    AUSF, and - for 4G <-> 5G interworking (N26) - an EPS security context (K_ASME) carried
    over GTPv2, from which it derives a mapped K_AMF (TS 33.501 Annex A.14). Every key found
    becomes one security context, so a trace with several UEs is decrypted in one pass.
+   Keys given with --kseaf / --kamf are added to the ones found in the trace, e.g. for a UE
+   whose security context was set up before the capture started.
 
 2. If SUPI cannot be extracted from the N12 authentication messages, the script searches for
    it inside the N2 messages between the AMF and the gNB.
@@ -51,8 +52,8 @@ Key inputs
 
   --kamf <64 hex>                    alternative: give K_AMF directly
 
-  Both options may be repeated (one value per security context); --supi and --abba are
-  shared by all --kseaf values. Only IMSI-type SUPIs are supported. Without --supi, the
+  Both options may be repeated (one value per security context) and are added to the keys
+  found in the trace; --supi and --abba are shared by all --kseaf values. Only IMSI-type SUPIs are supported. Without --supi, the
   SUPI is read from the first null-scheme SUCI in a Registration Request or Identity
   Response; a SUCI concealed with ECIES (Profile A/B) or a 5G-GUTI cannot be used.
 
@@ -442,6 +443,9 @@ def detect_amf(rows):
 
 
 def run_tshark(cmd):
+    # -n: no name resolution. Otherwise tshark does a reverse DNS lookup for every address
+    # in the trace, which can take tens of seconds; only numeric addresses are used here.
+    cmd = [cmd[0], "-n"] + cmd[1:]
     try:
         return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     except FileNotFoundError:
@@ -708,45 +712,88 @@ def find_sctp(frame, linktype):
     return None
 
 
-def read_classic_pcap(path):
-    """-> (24-byte global header, linktype, [[16-byte record header, bytearray frame], ...]) or None."""
-    raw = open(path, "rb").read()
-    little = (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1")
-    big = (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d")
-    if raw[:4] not in little + big:
-        return None
-    e = "<" if raw[:4] in little else ">"
+def _classic_pcap_frames(raw):
+    """[(offset of the packet data in raw, captured length, linktype), ...] for a classic pcap."""
+    e = "<" if raw[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1") else ">"
     linktype = struct.unpack(e + "I", raw[20:24])[0] & 0x0FFFFFFF
-    recs, off = [], 24
+    frames, off = [], 24
     while off + 16 <= len(raw):
         incl = struct.unpack(e + "I", raw[off + 8:off + 12])[0]
-        recs.append([raw[off:off + 16], bytearray(raw[off + 16:off + 16 + incl])])
+        frames.append((off + 16, min(incl, len(raw) - off - 16), linktype))
         off += 16 + incl
-    return raw[:24], linktype, recs
+    return frames
+
+
+def _pcapng_frames(raw):
+    """[(offset of the packet data in raw, captured length, linktype), ...] for a pcapng.
+    The linktype is per interface (IDB), so one file may mix e.g. Ethernet and Linux cooked
+    capture - which classic pcap cannot hold. Packets are numbered like tshark numbers frames:
+    every Enhanced, Simple and obsolete Packet Block, in file order, across all sections."""
+    frames, off, e, links = [], 0, "<", []
+    while off + 12 <= len(raw):
+        btype = struct.unpack(e + "I", raw[off:off + 4])[0]
+        if btype == 0x0A0D0D0A:                            # Section Header: byte order, new IDBs
+            e = "<" if raw[off + 8:off + 12] == b"\x4d\x3c\x2b\x1a" else ">"
+            links = []
+        blen = struct.unpack(e + "I", raw[off + 4:off + 8])[0]
+        if blen < 12 or off + blen > len(raw):
+            break
+        if btype == 1:                                     # Interface Description
+            links.append(struct.unpack(e + "H", raw[off + 8:off + 10])[0])
+        elif btype == 6:                                   # Enhanced Packet
+            ifc, caplen = struct.unpack(e + "I", raw[off + 8:off + 12])[0], \
+                struct.unpack(e + "I", raw[off + 20:off + 24])[0]
+            frames.append((off + 28, caplen, links[ifc] if ifc < len(links) else -1))
+        elif btype == 3:                                   # Simple Packet (interface 0)
+            orig = struct.unpack(e + "I", raw[off + 8:off + 12])[0]
+            frames.append((off + 12, min(orig, blen - 16), links[0] if links else -1))
+        elif btype == 2:                                   # Packet (obsolete)
+            ifc = struct.unpack(e + "H", raw[off + 8:off + 10])[0]
+            caplen = struct.unpack(e + "I", raw[off + 20:off + 24])[0]
+            frames.append((off + 28, caplen, links[ifc] if ifc < len(links) else -1))
+        off += blen
+    return frames
+
+
+def read_capture(path):
+    """-> (whole file as a bytearray, [(data offset, captured length, linktype), ...]) for a
+    classic pcap or a pcapng, or None for any other format. Frames are patched in place in the
+    bytearray, so the output keeps the input's format and every other byte."""
+    raw = bytearray(open(path, "rb").read())
+    if raw[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        return raw, _classic_pcap_frames(raw)
+    if raw[:4] == b"\x0a\x0d\x0d\x0a":
+        return raw, _pcapng_frames(raw)
+    return None
 
 
 def rewrite_n2(src, dst, repl, tshark):
     """Copy the N2 capture to dst, replacing NAS PDUs in place.
     repl = {frame number: [(old pdu, new pdu of identical length), ...]}.
     Everything else stays byte-identical, except the SCTP checksum of each changed frame,
-    which is recomputed (CRC32c). Returns (frames changed, list of problems)."""
-    loaded = read_classic_pcap(src)
+    which is recomputed (CRC32c). Classic pcap and pcapng are patched directly and keep their
+    format; anything else is converted by tshark (to pcapng, which accepts mixed link types).
+    Returns (frames changed, list of problems)."""
+    loaded = read_capture(src)
     tmp = None
-    if loaded is None:                                     # pcapng etc.: let tshark convert
-        tmp = dst + ".tmp.pcap"
+    if loaded is None:                                     # other formats: let tshark convert
+        tmp = dst + ".tmp.pcapng"
         try:
-            subprocess.run([tshark, "-r", src, "-F", "pcap", "-w", tmp],
-                           capture_output=True, check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError) as e:
-            raise SystemExit(f"could not convert {src} to classic pcap with tshark: {e}")
-        loaded = read_classic_pcap(tmp)
-    gh, linktype, recs = loaded
+            subprocess.run([tshark, "-r", src, "-F", "pcapng", "-w", tmp],
+                           capture_output=True, text=True, check=True)
+        except FileNotFoundError:
+            raise SystemExit(f"could not convert {src}: tshark not found")
+        except subprocess.CalledProcessError as e:
+            raise SystemExit(f"could not convert {src} to pcapng with tshark: {e.stderr.strip()}")
+        loaded = read_capture(tmp)
+    raw, frames = loaded
     changed, problems = 0, []
     for frame_no, items in sorted(repl.items()):
-        if not 1 <= frame_no <= len(recs):
+        if not 1 <= frame_no <= len(frames):
             problems.append(f"frame {frame_no}: not in the capture")
             continue
-        data = recs[frame_no - 1][1]
+        at, caplen, linktype = frames[frame_no - 1]
+        data = bytearray(raw[at:at + caplen])
         used, did = [], False
         for old, new in items:
             assert len(old) == len(new)
@@ -773,12 +820,10 @@ def rewrite_n2(src, dst, repl, tshark):
             s, e = loc
             data[s + 8:s + 12] = b"\x00\x00\x00\x00"
             data[s + 8:s + 12] = struct.pack("<I", crc32c(bytes(data[s:e])))
+        raw[at:at + caplen] = data
         changed += 1
     with open(dst, "wb") as f:
-        f.write(gh)
-        for rh, data in recs:
-            f.write(rh)
-            f.write(data)
+        f.write(raw)
     if tmp:
         import os
         os.remove(tmp)
@@ -834,8 +879,9 @@ def main():
                     help="AMF IPv4 or IPv6 address on N2, used with --pcap to tell DL from UL "
                          "(default: destination of the first readable Registration Request)")
     ap.add_argument("--kseaf", action="append", default=[],
-                    help="K_SEAF as 64 hex chars; repeat for several security contexts "
-                         "(default: read from the N12 signalling, else asked for)")
+                    help="K_SEAF as 64 hex chars; repeat for several security contexts; "
+                         "added to the keys read from the N12 signalling (asked for if "
+                         "there are none)")
     ap.add_argument("--kseaf-ascii", action="append", default=[],
                     help="K_SEAF in base64 text, e.g. 'L7j/BJhZPB3mJKHeQEza2ds+gH0cPZ1ZBw2ZGX7/7io=' "
                          "(quote it); same use as --kseaf, repeatable")
@@ -851,7 +897,8 @@ def main():
     ap.add_argument("--abba", default="0000",
                     help="ABBA parameter in hex, from the Authentication Request (default 0000)")
     ap.add_argument("--kamf", action="append", default=[],
-                    help="K_AMF as 64 hex chars, instead of --kseaf; repeatable")
+                    help="K_AMF as 64 hex chars, instead of --kseaf; repeatable; added to the "
+                         "keys found in the trace")
     ap.add_argument("--kamf-ascii", action="append", default=[],
                     help="K_AMF in base64 text (quote it); same use as --kamf, repeatable")
     ap.add_argument("--show-keys", action=argparse.BooleanOptionalAction, default=True,
@@ -908,17 +955,13 @@ def main():
     # interworking) - and from the command line. Every key found becomes a security context;
     # a multi-UE trace yields several, and each NAS message is tried against all of them.
     n12_path = a.n12_pcap or a.pcap
-    kseaf_given = a.kseaf or a.kseaf_ascii
-    kamf_given = a.kamf or a.kamf_ascii
-    want_auto = not kseaf_given and not kamf_given    # pull keys from the trace
-    want_n12 = want_auto or (kseaf_given and not a.supi)   # also read N12 just for the SUPI
     n12_keys, n12_supis = (read_n12(n12_path, a.tshark, a.n12_port, a.tls_keylog)
-                           if n12_path and want_n12 else ([], {}))
+                           if n12_path else ([], {}))
     # SUPIs seen anywhere in the SBI signalling (not only the auth exchange); N12 auth wins.
     sig_supis = n12_supis
-    if n12_path and want_n12:
+    if n12_path:
         sig_supis = {**read_sbi_supis(n12_path, a.tshark, a.n12_port, a.tls_keylog), **n12_supis}
-    mapped = read_gtpv2(a.pcap, a.tshark) if (a.pcap and want_auto) else []
+    mapped = read_gtpv2(a.pcap, a.tshark) if a.pcap else []
     if not n12_path:
         n12_why = "no N12 capture (pass --n12-pcap, or --pcap with N12 in it)"
     else:
@@ -936,10 +979,9 @@ def main():
     for m in mapped:
         kamf.append((m.k_amf, m.k_asme,
                      f"GTPv2 frame {m.frame}" + (f", imsi-{m.supi}" if m.supi else "")))
-    if want_auto:
-        for k in n12_keys:
-            seaf.append((k.k_seaf, k.supi or None,
-                         f"N12 frame {k.frame}" + (f", imsi-{k.supi}" if k.supi else "")))
+    for k in n12_keys:
+        seaf.append((k.k_seaf, k.supi or None,
+                     f"N12 frame {k.frame}" + (f", imsi-{k.supi}" if k.supi else "")))
 
     if not seaf and not kamf:
         kind, key = ask_key([n12_why])
@@ -986,13 +1028,17 @@ def main():
     if supi_srcs or amf is not None:
         print()
 
+    # A key given on the command line may also be in the trace: keep the first copy only.
     keysets = []
     for k_seaf, s, src in seaf:
-        keysets.append(make_keyset(f"ctx#{len(keysets)}", derive_kamf(k_seaf, s or supi, abba),
-                                   k_seaf=k_seaf, source=f"K_SEAF from {src}"))
+        k_amf = derive_kamf(k_seaf, s or supi, abba)
+        if all(k.k_amf != k_amf for k in keysets):
+            keysets.append(make_keyset(f"ctx#{len(keysets)}", k_amf,
+                                       k_seaf=k_seaf, source=f"K_SEAF from {src}"))
     for k_amf, k_asme, src in kamf:
         label = ("mapped K_AMF from " + src) if k_asme else ("K_AMF from " + src)
-        keysets.append(make_keyset(f"ctx#{len(keysets)}", k_amf, k_asme=k_asme, source=label))
+        if all(k.k_amf != k_amf for k in keysets):
+            keysets.append(make_keyset(f"ctx#{len(keysets)}", k_amf, k_asme=k_asme, source=label))
     if a.show_keys:
         for k in keysets:
             print(f"{k.label}:   ({k.source})")

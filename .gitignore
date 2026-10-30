@@ -29,3 +29,6 @@ sslkeys*
 .vscode/
 .idea/
 NAS-Deciphering.code-workspace
+
+# Claude Code project notes (local only)
+CLAUDE.md
